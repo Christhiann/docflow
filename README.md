@@ -1,12 +1,8 @@
 # DocFlow
 
-Aplicação web para upload e processamento assíncrono de documentos. O usuário envia um
-arquivo, o Django responde imediatamente e o processamento acontece fora da requisição
-HTTP, em um worker Celery com Redis como broker. O frontend acompanha a mudança de
-status até `COMPLETED` ou `FAILED`.
-
-Projeto de portfólio: escopo pequeno de propósito, com ênfase em arquitetura simples,
-segurança básica, testes e Docker.
+Aplicação web para upload e processamento assíncrono de documentos. A API é feita com
+Django REST Framework e o frontend com Next.js. O processamento acontece em um worker
+Celery usando Redis como broker.
 
 ## Features
 
@@ -21,7 +17,7 @@ segurança básica, testes e Docker.
 - Testes com pytest cobrindo autenticação, documentos e a task Celery
 - Ambiente completo em Docker Compose
 
-## Architecture
+## Como funciona
 
 Fluxo da requisição:
 
@@ -45,11 +41,11 @@ Redis (broker)
 atualiza o status do documento no PostgreSQL
 ```
 
-O upload responde `201` com status `PENDING`. A task é publicada em
-`transaction.on_commit`, então o worker nunca é acionado antes de o registro existir no
-banco. O frontend faz polling enquanto houver documentos em `PENDING` ou `PROCESSING`.
+O upload responde `201` com status `PENDING`. Depois do commit da transação, o Celery
+processa o arquivo e atualiza o status para `COMPLETED` ou `FAILED`. O frontend consulta
+os documentos enquanto houver itens pendentes.
 
-## Tech Stack
+## Stack
 
 **Backend**
 Python 3.11, Django 5, Django REST Framework, SimpleJWT, drf-spectacular, django-filter,
@@ -61,10 +57,9 @@ Next.js 14 (App Router), TypeScript, Tailwind CSS, React Hook Form, Zod, lucide-
 **Infraestrutura**
 Docker, Docker Compose, PostgreSQL 16, Redis 7.
 
-**Qualidade**
-pytest, pytest-django, Ruff (lint + format), ESLint, `tsc --noEmit`.
+**Qualidade**: pytest, pytest-django, Ruff, ESLint e TypeScript.
 
-## Running locally
+## Executar localmente
 
 Pré-requisitos: Docker Desktop e Git. Comandos testados no PowerShell (Windows 11).
 
@@ -137,7 +132,7 @@ npm install
 npm run dev
 ```
 
-## Environment variables
+## Variáveis de ambiente
 
 Copie `.env.example` para `.env` na raiz do projeto. Nenhum segredo entra no Git.
 
@@ -169,7 +164,7 @@ ALLOWED_UPLOAD_EXTENSIONS=pdf,txt,md,csv,docx,xlsx,png,jpg,jpeg
 NEXT_PUBLIC_API_URL=http://localhost:8000/api
 ```
 
-## API
+## API principal
 
 | Método | Endpoint                    | Descrição                             | Auth |
 | ------ | --------------------------- | ------------------------------------- | ---- |
@@ -198,22 +193,7 @@ curl.exe -X POST http://localhost:8000/api/documents/ `
   -F "file=@C:\caminho\para\arquivo.pdf"
 ```
 
-## Async processing
-
-Processar dentro da request prenderia o worker HTTP até o fim do trabalho: o usuário
-ficaria esperando, timeouts de proxy entrariam em cena e um erro no meio do caminho
-derrubaria a resposta inteira.
-
-Por isso o `POST /api/documents/` faz só o essencial — validar, salvar e publicar uma
-mensagem — e devolve `201` na hora. O **Redis** guarda a fila; o **Celery** consome, marca
-o documento como `PROCESSING`, executa `documents/services.py` e grava o resultado final.
-Qualquer exceção vira `FAILED` com a mensagem em `error_message`, sem quebrar a API.
-
-O "processamento" em si é simulado (um delay configurável e a extração de metadados do
-arquivo). O que o projeto demonstra é o fluxo: publicação depois do commit, transição de
-status, tratamento de falha e separação entre orquestração (task) e regra (service).
-
-## Testing
+## Testes
 
 ```powershell
 docker compose exec backend pytest
@@ -239,7 +219,7 @@ O que é testado:
 - **Celery**: task publicada após o commit, sucesso muda para `COMPLETED` com
   `processed_at`, falha muda para `FAILED` com mensagem, task ignora documento inexistente
 
-## Project structure
+## Estrutura
 
 ```
 docflow/
@@ -264,71 +244,9 @@ docflow/
 └── README.md
 ```
 
-## Technical decisions
+## Próximos passos para produção
 
-**Django + DRF** — o domínio é CRUD com autenticação e permissões, exatamente onde o
-Django economiza trabalho: ORM, migrations, hash de senha e admin já vêm prontos. O DRF
-dá serializers, permissions, paginação e filtros de forma idiomática.
-
-**PostgreSQL desde o desenvolvimento** — mesmo banco em dev e produção evita surpresas em
-tipos, constraints e transações. `transaction.on_commit` depende do comportamento real de
-transação, algo que o SQLite não reproduz do mesmo jeito.
-
-**Celery + Redis** — o trabalho é I/O que não precisa acontecer na request. O Celery
-entrega retry, timeouts e workers escaláveis sem código próprio; o Redis é um broker
-leve, que já resolve fila com latência baixa. Um sistema de mensageria maior seria
-desproporcional para este escopo.
-
-**JWT em vez de sessão** — o frontend é uma aplicação Next.js separada, em outra origem.
-Tokens evitam cookie cross-site e CSRF na API, e o refresh token mantém a sessão viva sem
-guardar a senha.
-
-**Isolamento por queryset** — `get_queryset` já filtra por `owner`, então documento de
-outro usuário retorna 404, não 403 (não vaza nem a existência do registro). A permission
-`IsOwner` fica como segunda camada explícita.
-
-**Service separado da task** — a task cuida de status e erro; `extract_metadata` cuida da
-regra. Dá para testar a regra sem Celery e a transição de status sem tocar no arquivo.
-Nenhuma camada além dessa: sem repositories, factories ou interfaces que o projeto não
-precisa.
-
-**Camada de API no frontend** — `src/lib/api/` concentra token, refresh automático no 401
-e tratamento de erro. Nenhum componente chama `fetch` direto.
-
-## Deploy
-
-O mesmo `docker-compose.yml` serve de base. Para produção: `DJANGO_DEBUG=False`,
-`DJANGO_SECRET_KEY` real, `ALLOWED_HOSTS` e `CORS_ALLOWED_ORIGINS` com o domínio,
-gunicorn no lugar do `runserver` (`gunicorn config.wsgi --bind 0.0.0.0:8000`), worker
-Celery como serviço separado, Postgres e Redis gerenciados, e um storage externo (S3 ou
-equivalente) para os arquivos de mídia. O frontend vai para a Vercel com
-`NEXT_PUBLIC_API_URL` apontando para a API.
-
-## Screenshots
-
-| Tela             | Imagem                                    |
-| ---------------- | ----------------------------------------- |
-| Login            | `docs/screenshots/login.png`              |
-| Dashboard        | `docs/screenshots/dashboard.png`          |
-| Lista            | `docs/screenshots/documents.png`          |
-| Upload           | `docs/screenshots/upload.png`             |
-| Detalhe          | `docs/screenshots/document-detail.png`    |
-| Swagger          | `docs/screenshots/swagger.png`            |
-
-> Substitua os caminhos acima por imagens reais depois de rodar o projeto:
-> `![Dashboard](docs/screenshots/dashboard.png)`
-
-## Commits sugeridos
-
-```
-chore: initialize project structure
-feat: configure django rest framework
-feat: implement user authentication
-feat: add document management API
-feat: add asynchronous document processing
-test: add authentication and document tests
-feat: create document dashboard
-feat: integrate frontend with document API
-chore: add docker development environment
-docs: add project documentation
-```
+- Usar `DJANGO_DEBUG=False` e variáveis de ambiente seguras.
+- Trocar o `runserver` por Gunicorn.
+- Usar Postgres, Redis e armazenamento de arquivos gerenciados.
+- Publicar o frontend com `NEXT_PUBLIC_API_URL` apontando para a API.
